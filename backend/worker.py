@@ -282,8 +282,8 @@ def _process_nerf(job_id: str, job_dir: Path) -> None:
     output_dir = job_dir / "output"
     set_progress(job_id, 5, "procesando", "Preprocesando imágenes…")
     validas = _preprocess_images(job_dir)
-    if len(validas) < 20:
-        raise RuntimeError(f"Solo {len(validas)} imágenes válidas; mínimo 20.")
+    if len(validas) < 10:
+        raise RuntimeError(f"Solo {len(validas)} imágenes válidas; mínimo 10.")
 
     set_progress(job_id, 18, "procesando", f"{len(validas)} imágenes. Calculando poses…")
     ns_data = job_dir / "ns_data"

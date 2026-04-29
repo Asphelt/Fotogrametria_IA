@@ -66,10 +66,11 @@ async def subir(imagenes: List[UploadFile] = File(...)):
     job_id = str(uuid.uuid4())
     job_dir = storage.create_job_dir(job_id)
 
-    # Guardar imágenes en disco
-    for img in imagenes:
+    # Guardar imágenes en disco (índice numérico para evitar colisiones de nombre)
+    for i, img in enumerate(imagenes):
         raw = await img.read()
-        safe_name = Path(img.filename).name
+        ext = Path(img.filename).suffix.lower() or ".jpg"
+        safe_name = f"{i:04d}{ext}"
         (job_dir / "images" / safe_name).write_bytes(raw)
 
     storage.update_job(job_id, {
