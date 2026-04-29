@@ -231,6 +231,7 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--database_path", str(db_path),
         "--image_path",    str(images_dir),
         "--ImageReader.single_camera", "1",
+        "--SiftExtraction.use_gpu", "0",
     ])
 
     # 3. Matching exhaustivo
@@ -238,6 +239,7 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
     _run([
         COLMAP_BIN, "exhaustive_matcher",
         "--database_path", str(db_path),
+        "--SiftMatching.use_gpu", "0",
     ], timeout=900)
 
     # 4. Reconstrucción sparse (SfM)
@@ -362,8 +364,13 @@ def process_job(job_id: str, job_dir: Path) -> None:
             _process_mock(job_id, job_dir)
         elif USE_COLMAP or Path(COLMAP_BIN).exists():
             _process_colmap(job_id, job_dir)
-        else:
+        elif shutil.which("ns-process-data"):
             _process_nerf(job_id, job_dir)
+        else:
+            raise RuntimeError(
+                "No se encontró COLMAP ni nerfstudio en el servidor. "
+                "Contacta al administrador."
+            )
     except Exception as exc:
         job = storage.get_job(job_id) or {}
         job.update({
