@@ -232,6 +232,9 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--image_path",    str(images_dir),
         "--ImageReader.single_camera", "1",
         "--SiftExtraction.use_gpu", "0",
+        "--SiftExtraction.num_threads", "1",
+        "--SiftExtraction.max_image_size", "1000",
+        "--SiftExtraction.max_num_features", "4096",
     ])
 
     # 3. Matching exhaustivo
@@ -240,6 +243,7 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         COLMAP_BIN, "exhaustive_matcher",
         "--database_path", str(db_path),
         "--SiftMatching.use_gpu", "0",
+        "--SiftMatching.num_threads", "1",
     ], timeout=900)
 
     # 4. Reconstrucción sparse (SfM)
