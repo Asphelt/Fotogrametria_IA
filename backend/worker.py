@@ -14,6 +14,9 @@ MOCK: bool = os.getenv("MOCK", "false").lower() in ("true", "1", "yes")
 
 COLMAP_BIN = shutil.which("colmap") or "/opt/homebrew/bin/colmap"
 
+# COLMAP necesita QT_QPA_PLATFORM=offscreen en servidores sin pantalla
+_COLMAP_ENV = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -147,38 +150,20 @@ def _preprocess_images(job_dir: Path) -> List[Path]:
 # ── Conversión PLY → GLB ──────────────────────────────────────────────────────
 
 def _pointcloud_ply_to_glb(ply_path: Path, glb_path: Path) -> None:
-    """Reconstrucción de superficie Poisson desde nube de puntos PLY → GLB."""
-    import open3d as o3d
+    import trimesh
+    import numpy as np
 
-    pcd = o3d.io.read_point_cloud(str(ply_path))
-    if len(pcd.points) < 100:
+    cloud = trimesh.load(str(ply_path))
+    points = np.asarray(cloud.vertices if hasattr(cloud, "vertices") else cloud.vertices)
+
+    if len(points) < 100:
         raise RuntimeError(
             "La nube de puntos tiene muy pocos puntos. "
             "Intenta con más fotos o mejor superposición."
         )
 
-    # Estimar normales si no las tiene
-    if not pcd.has_normals():
-        pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
-        )
-        pcd.orient_normals_consistent_tangent_plane(100)
-
-    # Reconstrucción Poisson
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd, depth=9
-    )
-
-    # Eliminar triángulos de baja densidad (artefactos en bordes)
-    import numpy as np
-    densities_arr = np.asarray(densities)
-    threshold = np.percentile(densities_arr, 10)
-    keep = densities_arr >= threshold
-    mesh.remove_vertices_by_mask(~keep)
-    mesh.remove_degenerate_triangles()
-    mesh.remove_unreferenced_vertices()
-
-    o3d.io.write_triangle_mesh(str(glb_path), mesh)
+    mesh = trimesh.PointCloud(points).convex_hull
+    mesh.export(str(glb_path))
 
 
 def _mesh_ply_to_glb(ply_path: Path, glb_path: Path) -> None:
@@ -235,7 +220,7 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--SiftExtraction.num_threads", "1",
         "--SiftExtraction.max_image_size", "1000",
         "--SiftExtraction.max_num_features", "4096",
-    ])
+    ], env=_COLMAP_ENV)
 
     # 3. Matching exhaustivo
     set_progress(job_id, 30, "procesando", f"Emparejando {len(validas)} imágenes…")
@@ -244,7 +229,7 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--database_path", str(db_path),
         "--SiftMatching.use_gpu", "0",
         "--SiftMatching.num_threads", "1",
-    ], timeout=900)
+    ], timeout=900, env=_COLMAP_ENV)
 
     # 4. Reconstrucción sparse (SfM)
     set_progress(job_id, 50, "procesando", "Reconstrucción sparse (SfM)…")
@@ -253,7 +238,8 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--database_path", str(db_path),
         "--image_path",    str(images_dir),
         "--output_path",   str(sparse_dir),
-    ], timeout=900)
+        "--Mapper.num_threads", "1",
+    ], timeout=1800, env=_COLMAP_ENV)
 
     # Verificar que se generó un modelo
     models = sorted(sparse_dir.iterdir())
@@ -272,14 +258,15 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--input_path",  str(best_model),
         "--output_path", str(sparse_ply),
         "--output_type", "PLY",
-    ])
+    ], env=_COLMAP_ENV)
 
-    # 6. Reconstrucción de superficie Poisson (CPU, Open3D)
-    set_progress(job_id, 82, "exportando", "Reconstruyendo superficie 3D (Poisson)…")
+    # 6. Reconstrucción de superficie (convex hull vía trimesh)
+    set_progress(job_id, 82, "exportando", "Reconstruyendo superficie 3D…")
     glb_path = output_dir / "modelo.glb"
     _pointcloud_ply_to_glb(sparse_ply, glb_path)
 
     _finish_job(job_id, glb_path)
+    _cleanup_intermediates(job_dir)
 
 
 # ── Modo REAL nerfstudio (GPU) ────────────────────────────────────────────────
@@ -343,6 +330,19 @@ def _process_nerf(job_id: str, job_dir: Path) -> None:
     else:
         raise RuntimeError("No se generó ningún archivo de modelo.")
     _finish_job(job_id, model_path)
+
+
+# ── Limpieza de archivos intermedios ─────────────────────────────────────────
+
+def _cleanup_intermediates(job_dir: Path) -> None:
+    for name in ["images", "processed", "sparse", "ns_data", "ns_output"]:
+        p = job_dir / name
+        if p.exists():
+            shutil.rmtree(p, ignore_errors=True)
+    for fname in ["colmap.db", "sparse_points.ply"]:
+        p = job_dir / fname
+        if p.exists():
+            p.unlink(missing_ok=True)
 
 
 # ── Finalizar trabajo ─────────────────────────────────────────────────────────
