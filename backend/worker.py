@@ -14,8 +14,30 @@ MOCK: bool = os.getenv("MOCK", "false").lower() in ("true", "1", "yes")
 
 COLMAP_BIN = shutil.which("colmap") or "/opt/homebrew/bin/colmap"
 
-# COLMAP necesita QT_QPA_PLATFORM=offscreen en servidores sin pantalla
+# En Linux sin display usamos xvfb-run para que COLMAP pueda crear contexto OpenGL
+_IS_LINUX = sys.platform == "linux"
+_XVFB = shutil.which("xvfb-run")
 _COLMAP_ENV = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
+
+
+def _colmap_cmd(args: List[str]) -> List[str]:
+    """Prefija con xvfb-run en Linux si está disponible."""
+    if _IS_LINUX and _XVFB:
+        return [_XVFB, "-a", "--"] + args
+    return args
+
+
+def _colmap_supports_use_gpu() -> bool:
+    """COLMAP ≥4.0 eliminó la flag --SiftExtraction.use_gpu."""
+    r = subprocess.run(
+        [COLMAP_BIN, "feature_extractor", "--help"],
+        capture_output=True, text=True
+    )
+    return "use_gpu" in (r.stdout + r.stderr)
+
+
+_USE_GPU_FLAG: bool = False  # se evalúa la primera vez que se necesita
+_GPU_FLAG_CHECKED: bool = False
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -186,22 +208,31 @@ def _mesh_ply_to_glb(ply_path: Path, glb_path: Path) -> None:
 # ── COLMAP pipeline ───────────────────────────────────────────────────────────
 
 def _run(cmd: List[str], timeout: int = 600, **kwargs) -> subprocess.CompletedProcess:
+    full_cmd = _colmap_cmd(cmd) if cmd and cmd[0] == COLMAP_BIN else cmd
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, **kwargs
+        full_cmd, capture_output=True, text=True, timeout=timeout, **kwargs
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"Falló: {' '.join(cmd[:2])}\n{result.stderr[-600:]}"
+            f"Falló: {' '.join(cmd[:2])}\n{result.stderr[-800:]}"
         )
     return result
 
 
 def _process_colmap(job_id: str, job_dir: Path) -> None:
+    global _USE_GPU_FLAG, _GPU_FLAG_CHECKED
     if not Path(COLMAP_BIN).exists():
         raise RuntimeError(
             f"COLMAP no encontrado en {COLMAP_BIN}. "
             "Instálalo con: brew install colmap"
         )
+
+    if not _GPU_FLAG_CHECKED:
+        _USE_GPU_FLAG = _colmap_supports_use_gpu()
+        _GPU_FLAG_CHECKED = True
+
+    gpu_off = ["--SiftExtraction.use_gpu", "0"] if _USE_GPU_FLAG else []
+    match_gpu_off = ["--SiftMatching.use_gpu", "0"] if _USE_GPU_FLAG else []
 
     output_dir = job_dir / "output"
     db_path    = job_dir / "colmap.db"
@@ -227,6 +258,7 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--SiftExtraction.num_threads", "1",
         "--SiftExtraction.max_image_size", "1000",
         "--SiftExtraction.max_num_features", "4096",
+        *gpu_off,
     ], env=_COLMAP_ENV)
 
     # 3. Matching exhaustivo
@@ -235,6 +267,7 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         COLMAP_BIN, "exhaustive_matcher",
         "--database_path", str(db_path),
         "--SiftMatching.num_threads", "1",
+        *match_gpu_off,
     ], timeout=900, env=_COLMAP_ENV)
 
     # 4. Reconstrucción sparse (SfM)

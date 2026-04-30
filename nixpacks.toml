@@ -1,5 +1,5 @@
 [phases.setup]
-aptPkgs = ["colmap", "libgomp1"]
+aptPkgs = ["colmap", "libgomp1", "xvfb"]
 
 [start]
 cmd = "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000}"
