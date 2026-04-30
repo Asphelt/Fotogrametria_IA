@@ -150,22 +150,45 @@ def _process_mock(job_id: str, job_dir: Path) -> None:
 
 def _preprocess_images(job_dir: Path) -> List[Path]:
     from PIL import Image
+
+    # Intentar cargar rembg para eliminar fondo
+    _rembg_session = None
+    try:
+        from rembg import new_session, remove as rembg_remove
+        # u2netp es el modelo pequeño (~4 MB), rápido en CPU
+        _rembg_session = new_session("u2netp")
+        print("[worker] rembg cargado — se eliminará el fondo de cada imagen")
+    except Exception as e:
+        print(f"[worker] rembg no disponible ({e}), se usarán imágenes originales")
+
     src = job_dir / "images"
     dst = job_dir / "processed"
     dst.mkdir(exist_ok=True)
     valid: List[Path] = []
+
     for i, p in enumerate(sorted(src.glob("*"))):
         try:
             with Image.open(p) as img:
                 img = img.convert("RGB")
-                img.thumbnail((2000, 2000), Image.LANCZOS)
-                clean = Image.new("RGB", img.size)
-                clean.putdata(list(img.getdata()))
+                img.thumbnail((1500, 1500), Image.LANCZOS)
+
+                if _rembg_session is not None:
+                    try:
+                        # Quitar fondo → RGBA con transparencia
+                        rgba = rembg_remove(img, session=_rembg_session)
+                        # Pegar sobre fondo blanco (COLMAP funciona mejor con JPEG)
+                        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                        bg.paste(rgba, mask=rgba.split()[3])
+                        img = bg
+                    except Exception as e:
+                        print(f"[worker] rembg falló en {p.name}: {e}")
+
                 out = dst / f"{i:04d}.jpg"
-                clean.save(out, "JPEG", quality=92)
+                img.save(out, "JPEG", quality=92)
                 valid.append(out)
         except Exception as e:
             print(f"[worker] skip {p.name}: {e}")
+
     return valid
 
 
