@@ -172,28 +172,49 @@ def _preprocess_images(job_dir: Path) -> List[Path]:
 # ── Conversión PLY → GLB ──────────────────────────────────────────────────────
 
 def _ply_to_glb(ply_path: Path, glb_path: Path) -> None:
-    """Convierte cualquier PLY (nube de puntos o malla) a GLB con trimesh."""
+    """Convierte PLY (nube de puntos o malla) a GLB."""
     import trimesh
     import numpy as np
 
     loaded = trimesh.load(str(ply_path))
 
-    if isinstance(loaded, trimesh.PointCloud) or (
-        hasattr(loaded, "vertices") and not hasattr(loaded, "faces")
-    ):
-        pts = np.asarray(loaded.vertices)
-        if len(pts) < 50:
-            raise RuntimeError(
-                "Muy pocos puntos reconstruidos. "
-                "Sube más fotos con mayor superposición."
-            )
-        mesh = trimesh.PointCloud(pts).convex_hull
-    else:
-        mesh = loaded
-        if hasattr(mesh, "geometry"):
-            mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
+    # Si es malla real (tiene caras), exportar directo
+    if isinstance(loaded, trimesh.Trimesh) and len(loaded.faces) > 0:
+        loaded.export(str(glb_path))
+        return
+    if hasattr(loaded, "geometry"):
+        parts = [v for v in loaded.geometry.values()
+                 if isinstance(v, trimesh.Trimesh) and len(v.faces) > 0]
+        if parts:
+            trimesh.util.concatenate(parts).export(str(glb_path))
+            return
 
-    mesh.export(str(glb_path))
+    # Es nube de puntos → reconstrucción Poisson con scipy
+    pts = np.asarray(loaded.vertices if hasattr(loaded, "vertices") else list(loaded.vertices))
+    if len(pts) < 50:
+        raise RuntimeError(
+            "Muy pocos puntos reconstruidos. "
+            "Sube más fotos con mayor superposición entre ellas."
+        )
+
+    try:
+        from scipy.spatial import ConvexHull, Delaunay
+        # Reconstrucción Delaunay 3D: más fiel a la forma que convex hull
+        tri = Delaunay(pts)
+        # Extraer caras de la superficie (simplices que tienen un vecino nulo)
+        neighbors = tri.neighbors
+        surface_simplices = tri.simplices[np.any(neighbors == -1, axis=1)]
+        mesh = trimesh.Trimesh(vertices=pts, faces=surface_simplices, process=True)
+        mesh.remove_degenerate_faces()
+        mesh.remove_unreferenced_vertices()
+        if len(mesh.faces) > 100:
+            mesh.export(str(glb_path))
+            return
+    except Exception:
+        pass
+
+    # Último fallback: convex hull
+    trimesh.PointCloud(pts).convex_hull.export(str(glb_path))
 
 
 def _mesh_ply_to_glb(ply_path: Path, glb_path: Path) -> None:
@@ -248,7 +269,7 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         )
     images_dir = job_dir / "processed"
 
-    # 2. Extracción de características SIFT
+    # 2. Extracción de características SIFT (alta densidad)
     set_progress(job_id, 15, "procesando", "Extrayendo características SIFT…")
     _run([
         COLMAP_BIN, "feature_extractor",
@@ -256,21 +277,24 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--image_path",    str(images_dir),
         "--ImageReader.single_camera", "1",
         "--SiftExtraction.num_threads", "1",
-        "--SiftExtraction.max_image_size", "1000",
-        "--SiftExtraction.max_num_features", "4096",
+        "--SiftExtraction.max_image_size", "1500",
+        "--SiftExtraction.max_num_features", "8192",
+        "--SiftExtraction.peak_threshold", "0.003",
         *gpu_off,
     ], env=_COLMAP_ENV)
 
-    # 3. Matching exhaustivo
+    # 3. Matching exhaustivo con más iteraciones
     set_progress(job_id, 30, "procesando", f"Emparejando {len(validas)} imágenes…")
     _run([
         COLMAP_BIN, "exhaustive_matcher",
         "--database_path", str(db_path),
         "--SiftMatching.num_threads", "1",
+        "--SiftMatching.max_ratio", "0.85",
+        "--SiftMatching.max_distance", "0.7",
         *match_gpu_off,
-    ], timeout=900, env=_COLMAP_ENV)
+    ], timeout=1200, env=_COLMAP_ENV)
 
-    # 4. Reconstrucción sparse (SfM)
+    # 4. Reconstrucción sparse con configuración de calidad
     set_progress(job_id, 50, "procesando", "Reconstrucción sparse (SfM)…")
     _run([
         COLMAP_BIN, "mapper",
@@ -278,6 +302,11 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--image_path",    str(images_dir),
         "--output_path",   str(sparse_dir),
         "--Mapper.num_threads", "1",
+        "--Mapper.min_num_matches", "10",
+        "--Mapper.init_min_num_inliers", "50",
+        "--Mapper.ba_refine_focal_length", "1",
+        "--Mapper.ba_refine_principal_point", "0",
+        "--Mapper.ba_global_max_num_iterations", "30",
     ], timeout=1800, env=_COLMAP_ENV)
 
     # Verificar que se generó un modelo
@@ -285,33 +314,47 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
     if not models:
         raise RuntimeError(
             "COLMAP no pudo reconstruir el modelo. "
-            "Intenta con más fotos, mejor iluminación y mayor superposición."
+            "Asegúrate de que las fotos tengan buena superposición (~60%) "
+            "e iluminación uniforme."
         )
-    best_model = models[0]
-
-    # 5. Malla Delaunay desde el modelo sparse (CPU, sin GPU)
-    set_progress(job_id, 68, "entrenando", "Generando malla 3D (Delaunay)…")
-    mesh_ply = job_dir / "mesh_delaunay.ply"
-    result = subprocess.run(
-        [COLMAP_BIN, "delaunay_mesher",
-         "--input_path",  str(best_model),
-         "--output_path", str(mesh_ply),
-         "--DelaunayMeshing.input_type", "sparse"],
-        capture_output=True, text=True, timeout=600, env=_COLMAP_ENV
+    # Usar el modelo con más puntos
+    best_model = max(
+        models,
+        key=lambda p: len(list(p.glob("points3D.*"))) + len(list(p.glob("images.*")))
     )
-    # Si delaunay_mesher falla (versión antigua de colmap), caer a PLY export
-    if result.returncode != 0 or not mesh_ply.exists():
-        sparse_ply = job_dir / "sparse_points.ply"
-        _run([
-            COLMAP_BIN, "model_converter",
-            "--input_path",  str(best_model),
-            "--output_path", str(sparse_ply),
-            "--output_type", "PLY",
-        ], env=_COLMAP_ENV)
+
+    # 5. Exportar nube de puntos densa a PLY
+    set_progress(job_id, 68, "entrenando", "Exportando nube de puntos 3D…")
+    sparse_ply = job_dir / "sparse_points.ply"
+    _run([
+        COLMAP_BIN, "model_converter",
+        "--input_path",  str(best_model),
+        "--output_path", str(sparse_ply),
+        "--output_type", "PLY",
+    ], env=_COLMAP_ENV)
+
+    # 6. Intentar malla Delaunay (mejor que convex hull)
+    set_progress(job_id, 78, "entrenando", "Generando malla 3D (Delaunay)…")
+    mesh_ply = job_dir / "mesh_delaunay.ply"
+
+    # Probar con y sin --DelaunayMeshing.input_type (varía según versión de COLMAP)
+    for extra in [["--DelaunayMeshing.input_type", "sparse"], []]:
+        r = subprocess.run(
+            _colmap_cmd([COLMAP_BIN, "delaunay_mesher",
+                         "--input_path",  str(best_model),
+                         "--output_path", str(mesh_ply),
+                         *extra]),
+            capture_output=True, text=True, timeout=600, env=_COLMAP_ENV
+        )
+        if r.returncode == 0 and mesh_ply.exists() and mesh_ply.stat().st_size > 1000:
+            break
+        mesh_ply.unlink(missing_ok=True)
+    else:
+        # Fallback: reconstrucción Poisson con scipy sobre la nube sparse
         mesh_ply = sparse_ply
 
-    # 6. Convertir PLY → GLB
-    set_progress(job_id, 88, "exportando", "Exportando a .GLB…")
+    # 7. Convertir PLY → GLB
+    set_progress(job_id, 90, "exportando", "Exportando a .GLB…")
     glb_path = output_dir / "modelo.glb"
     _ply_to_glb(mesh_ply, glb_path)
 
