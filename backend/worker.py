@@ -150,20 +150,45 @@ def _preprocess_images(job_dir: Path) -> List[Path]:
 # ── Conversión PLY → GLB ──────────────────────────────────────────────────────
 
 def _pointcloud_ply_to_glb(ply_path: Path, glb_path: Path) -> None:
-    import trimesh
+    import open3d as o3d
     import numpy as np
 
-    cloud = trimesh.load(str(ply_path))
-    points = np.asarray(cloud.vertices if hasattr(cloud, "vertices") else cloud.vertices)
-
-    if len(points) < 100:
+    pcd = o3d.io.read_point_cloud(str(ply_path))
+    if len(pcd.points) < 50:
         raise RuntimeError(
             "La nube de puntos tiene muy pocos puntos. "
-            "Intenta con más fotos o mejor superposición."
+            "Intenta con más fotos o mejor superposición entre ellas."
         )
 
-    mesh = trimesh.PointCloud(points).convex_hull
-    mesh.export(str(glb_path))
+    # Limpiar outliers estadísticos
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+    # Estimar normales orientadas al centroide
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+    )
+    pcd.orient_normals_towards_camera_location(pcd.get_center())
+
+    # Reconstrucción de superficie Poisson
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=8, scale=1.1, linear_fit=False
+    )
+
+    # Eliminar triángulos de baja densidad (artefactos en bordes)
+    densities = np.asarray(densities)
+    keep_mask = densities > np.percentile(densities, 15)
+    mesh.remove_vertices_by_mask(~keep_mask)
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+    mesh.compute_vertex_normals()
+
+    tmp_ply = ply_path.parent / "mesh_poisson.ply"
+    o3d.io.write_triangle_mesh(str(tmp_ply), mesh)
+
+    # Convertir a GLB con trimesh
+    import trimesh
+    m = trimesh.load(str(tmp_ply), force="mesh")
+    m.export(str(glb_path))
 
 
 def _mesh_ply_to_glb(ply_path: Path, glb_path: Path) -> None:
