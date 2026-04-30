@@ -149,46 +149,29 @@ def _preprocess_images(job_dir: Path) -> List[Path]:
 
 # ── Conversión PLY → GLB ──────────────────────────────────────────────────────
 
-def _pointcloud_ply_to_glb(ply_path: Path, glb_path: Path) -> None:
-    import open3d as o3d
+def _ply_to_glb(ply_path: Path, glb_path: Path) -> None:
+    """Convierte cualquier PLY (nube de puntos o malla) a GLB con trimesh."""
+    import trimesh
     import numpy as np
 
-    pcd = o3d.io.read_point_cloud(str(ply_path))
-    if len(pcd.points) < 50:
-        raise RuntimeError(
-            "La nube de puntos tiene muy pocos puntos. "
-            "Intenta con más fotos o mejor superposición entre ellas."
-        )
+    loaded = trimesh.load(str(ply_path))
 
-    # Limpiar outliers estadísticos
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    if isinstance(loaded, trimesh.PointCloud) or (
+        hasattr(loaded, "vertices") and not hasattr(loaded, "faces")
+    ):
+        pts = np.asarray(loaded.vertices)
+        if len(pts) < 50:
+            raise RuntimeError(
+                "Muy pocos puntos reconstruidos. "
+                "Sube más fotos con mayor superposición."
+            )
+        mesh = trimesh.PointCloud(pts).convex_hull
+    else:
+        mesh = loaded
+        if hasattr(mesh, "geometry"):
+            mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
 
-    # Estimar normales orientadas al centroide
-    pcd.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
-    )
-    pcd.orient_normals_towards_camera_location(pcd.get_center())
-
-    # Reconstrucción de superficie Poisson
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd, depth=8, scale=1.1, linear_fit=False
-    )
-
-    # Eliminar triángulos de baja densidad (artefactos en bordes)
-    densities = np.asarray(densities)
-    keep_mask = densities > np.percentile(densities, 15)
-    mesh.remove_vertices_by_mask(~keep_mask)
-    mesh.remove_degenerate_triangles()
-    mesh.remove_unreferenced_vertices()
-    mesh.compute_vertex_normals()
-
-    tmp_ply = ply_path.parent / "mesh_poisson.ply"
-    o3d.io.write_triangle_mesh(str(tmp_ply), mesh)
-
-    # Convertir a GLB con trimesh
-    import trimesh
-    m = trimesh.load(str(tmp_ply), force="mesh")
-    m.export(str(glb_path))
+    mesh.export(str(glb_path))
 
 
 def _mesh_ply_to_glb(ply_path: Path, glb_path: Path) -> None:
@@ -241,7 +224,6 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--database_path", str(db_path),
         "--image_path",    str(images_dir),
         "--ImageReader.single_camera", "1",
-        "--SiftExtraction.use_gpu", "0",
         "--SiftExtraction.num_threads", "1",
         "--SiftExtraction.max_image_size", "1000",
         "--SiftExtraction.max_num_features", "4096",
@@ -252,7 +234,6 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
     _run([
         COLMAP_BIN, "exhaustive_matcher",
         "--database_path", str(db_path),
-        "--SiftMatching.use_gpu", "0",
         "--SiftMatching.num_threads", "1",
     ], timeout=900, env=_COLMAP_ENV)
 
@@ -275,20 +256,31 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         )
     best_model = models[0]
 
-    # 5. Exportar nube de puntos sparse a PLY
-    set_progress(job_id, 68, "entrenando", "Exportando nube de puntos 3D…")
-    sparse_ply = job_dir / "sparse_points.ply"
-    _run([
-        COLMAP_BIN, "model_converter",
-        "--input_path",  str(best_model),
-        "--output_path", str(sparse_ply),
-        "--output_type", "PLY",
-    ], env=_COLMAP_ENV)
+    # 5. Malla Delaunay desde el modelo sparse (CPU, sin GPU)
+    set_progress(job_id, 68, "entrenando", "Generando malla 3D (Delaunay)…")
+    mesh_ply = job_dir / "mesh_delaunay.ply"
+    result = subprocess.run(
+        [COLMAP_BIN, "delaunay_mesher",
+         "--input_path",  str(best_model),
+         "--output_path", str(mesh_ply),
+         "--DelaunayMeshing.input_type", "sparse"],
+        capture_output=True, text=True, timeout=600, env=_COLMAP_ENV
+    )
+    # Si delaunay_mesher falla (versión antigua de colmap), caer a PLY export
+    if result.returncode != 0 or not mesh_ply.exists():
+        sparse_ply = job_dir / "sparse_points.ply"
+        _run([
+            COLMAP_BIN, "model_converter",
+            "--input_path",  str(best_model),
+            "--output_path", str(sparse_ply),
+            "--output_type", "PLY",
+        ], env=_COLMAP_ENV)
+        mesh_ply = sparse_ply
 
-    # 6. Reconstrucción de superficie (convex hull vía trimesh)
-    set_progress(job_id, 82, "exportando", "Reconstruyendo superficie 3D…")
+    # 6. Convertir PLY → GLB
+    set_progress(job_id, 88, "exportando", "Exportando a .GLB…")
     glb_path = output_dir / "modelo.glb"
-    _pointcloud_ply_to_glb(sparse_ply, glb_path)
+    _ply_to_glb(mesh_ply, glb_path)
 
     _finish_job(job_id, glb_path)
     _cleanup_intermediates(job_dir)
