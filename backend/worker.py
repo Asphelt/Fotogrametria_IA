@@ -151,19 +151,19 @@ def _process_mock(job_id: str, job_dir: Path) -> None:
 def _preprocess_images(job_dir: Path) -> List[Path]:
     from PIL import Image
 
-    # Intentar cargar rembg para eliminar fondo
     _rembg_session = None
     try:
         from rembg import new_session, remove as rembg_remove
-        # u2netp es el modelo pequeño (~4 MB), rápido en CPU
         _rembg_session = new_session("u2netp")
-        print("[worker] rembg cargado — se eliminará el fondo de cada imagen")
+        print("[worker] rembg listo")
     except Exception as e:
-        print(f"[worker] rembg no disponible ({e}), se usarán imágenes originales")
+        print(f"[worker] rembg no disponible: {e}")
 
-    src = job_dir / "images"
-    dst = job_dir / "processed"
+    src      = job_dir / "images"
+    dst      = job_dir / "processed"
+    masks_dir = job_dir / "masks"
     dst.mkdir(exist_ok=True)
+    masks_dir.mkdir(exist_ok=True)
     valid: List[Path] = []
 
     for i, p in enumerate(sorted(src.glob("*"))):
@@ -171,25 +171,193 @@ def _preprocess_images(job_dir: Path) -> List[Path]:
             with Image.open(p) as img:
                 img = img.convert("RGB")
                 img.thumbnail((1500, 1500), Image.LANCZOS)
+                name = f"{i:04d}"
 
                 if _rembg_session is not None:
                     try:
-                        # Quitar fondo → RGBA con transparencia
                         rgba = rembg_remove(img, session=_rembg_session)
-                        # Pegar sobre fondo blanco (COLMAP funciona mejor con JPEG)
+                        alpha = rgba.split()[3]
+                        # Guardar máscara binaria (blanco = objeto)
+                        alpha.save(masks_dir / f"{name}.png")
+                        # Imagen con fondo blanco para COLMAP
                         bg = Image.new("RGB", rgba.size, (255, 255, 255))
-                        bg.paste(rgba, mask=rgba.split()[3])
+                        bg.paste(rgba, mask=alpha)
                         img = bg
                     except Exception as e:
-                        print(f"[worker] rembg falló en {p.name}: {e}")
+                        print(f"[worker] rembg error en {p.name}: {e}")
 
-                out = dst / f"{i:04d}.jpg"
+                out = dst / f"{name}.jpg"
                 img.save(out, "JPEG", quality=92)
                 valid.append(out)
         except Exception as e:
             print(f"[worker] skip {p.name}: {e}")
 
     return valid
+
+
+# ── Visual Hull (voxel carving con siluetas) ──────────────────────────────────
+
+def _parse_colmap_cameras(cameras_txt: Path) -> dict:
+    cameras = {}
+    for line in cameras_txt.read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split()
+        cam_id = int(parts[0])
+        model  = parts[1]
+        w, h   = int(parts[2]), int(parts[3])
+        params = list(map(float, parts[4:]))
+        # Soportamos PINHOLE y SIMPLE_PINHOLE
+        if model in ("PINHOLE", "OPENCV"):
+            fx, fy, cx, cy = params[0], params[1], params[2], params[3]
+        elif model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
+            f = params[0]; cx, cy = params[1], params[2]
+            fx = fy = f
+        else:
+            fx = fy = max(w, h) * 1.2; cx, cy = w / 2, h / 2
+        cameras[cam_id] = {"w": w, "h": h, "fx": fx, "fy": fy, "cx": cx, "cy": cy}
+    return cameras
+
+
+def _parse_colmap_images(images_txt: Path) -> list:
+    import numpy as np
+    imgs = []
+    lines = [l for l in images_txt.read_text().splitlines()
+             if not l.startswith("#") and l.strip()]
+    i = 0
+    while i < len(lines):
+        parts = lines[i].split()
+        if len(parts) < 9:
+            i += 1; continue
+        qw, qx, qy, qz = map(float, parts[1:5])
+        tx, ty, tz      = map(float, parts[5:8])
+        cam_id = int(parts[8])
+        name   = parts[9]
+        # Cuaternión → matriz de rotación
+        q = np.array([qw, qx, qy, qz])
+        R = np.array([
+            [1-2*(qy**2+qz**2), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+            [2*(qx*qy+qz*qw), 1-2*(qx**2+qz**2), 2*(qy*qz-qx*qw)],
+            [2*(qx*qz-qy*qw), 2*(qy*qz+qx*qw), 1-2*(qx**2+qy**2)],
+        ])
+        t = np.array([tx, ty, tz])
+        imgs.append({"name": name, "cam_id": cam_id, "R": R, "t": t})
+        i += 2  # saltar línea de puntos 2D
+    return imgs
+
+
+def _visual_hull(
+    sparse_txt_dir: Path,
+    masks_dir: Path,
+    output_ply: Path,
+    grid_size: int = 96,
+) -> bool:
+    import numpy as np
+
+    cameras_txt = sparse_txt_dir / "cameras.txt"
+    images_txt  = sparse_txt_dir / "images.txt"
+    points_txt  = sparse_txt_dir / "points3D.txt"
+
+    if not cameras_txt.exists() or not images_txt.exists():
+        return False
+
+    cameras = _parse_colmap_cameras(cameras_txt)
+    images  = _parse_colmap_images(images_txt)
+    if not images:
+        return False
+
+    # Bounding box desde puntos 3D sparse
+    pts = []
+    for line in points_txt.read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        p = line.split()
+        if len(p) >= 4:
+            pts.append([float(p[1]), float(p[2]), float(p[3])])
+    if len(pts) < 10:
+        return False
+
+    pts = np.array(pts)
+    # Ampliar bounding box un 20%
+    mn = pts.min(axis=0); mx = pts.max(axis=0)
+    pad = (mx - mn) * 0.2
+    mn -= pad; mx += pad
+
+    # Crear grid de vóxeles (todos activos al inicio)
+    xs = np.linspace(mn[0], mx[0], grid_size)
+    ys = np.linspace(mn[1], mx[1], grid_size)
+    zs = np.linspace(mn[2], mx[2], grid_size)
+    GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
+    world_pts = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], axis=1)  # (N,3)
+    voxels = np.ones(grid_size**3, dtype=bool)
+
+    carved = 0
+    for img_data in images:
+        cam = cameras.get(img_data["cam_id"])
+        if cam is None:
+            continue
+        # Buscar máscara correspondiente
+        stem = Path(img_data["name"]).stem
+        mask_path = masks_dir / f"{stem}.png"
+        if not mask_path.exists():
+            continue
+
+        from PIL import Image
+        mask = np.array(Image.open(mask_path).convert("L")) > 128  # True=objeto
+
+        R = img_data["R"]; t = img_data["t"]
+        fx, fy = cam["fx"], cam["fy"]
+        cx, cy = cam["cx"], cam["cy"]
+        W, H   = cam["w"], cam["h"]
+
+        # Proyectar todos los vóxeles a esta cámara
+        cam_pts = (R @ world_pts.T).T + t      # (N,3) en espacio cámara
+        valid_z = cam_pts[:, 2] > 0
+        px = np.full(len(world_pts), -1.0)
+        py = np.full(len(world_pts), -1.0)
+        px[valid_z] = fx * cam_pts[valid_z, 0] / cam_pts[valid_z, 2] + cx
+        py[valid_z] = fy * cam_pts[valid_z, 1] / cam_pts[valid_z, 2] + cy
+
+        pxi = np.round(px).astype(int)
+        pyi = np.round(py).astype(int)
+        in_frame = (pxi >= 0) & (pxi < W) & (pyi >= 0) & (pyi < H) & valid_z
+
+        # Vóxeles que caen fuera del objeto en esta vista → eliminar
+        in_silhouette = np.zeros(len(world_pts), dtype=bool)
+        in_silhouette[in_frame] = mask[pyi[in_frame], pxi[in_frame]]
+        voxels &= (~in_frame) | in_silhouette
+        carved += 1
+
+    if carved == 0:
+        return False
+
+    voxel_grid = voxels.reshape(grid_size, grid_size, grid_size)
+
+    # Marching cubes → malla
+    try:
+        from skimage.measure import marching_cubes
+        smooth = voxel_grid.astype(float)
+        verts, faces, _, _ = marching_cubes(smooth, level=0.5)
+        # Escalar verts a coordenadas del mundo
+        scale = (mx - mn) / grid_size
+        verts = verts * scale + mn
+    except Exception as e:
+        print(f"[worker] marching_cubes error: {e}")
+        return False
+
+    # Escribir PLY
+    with open(output_ply, "w") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {len(verts)}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write(f"element face {len(faces)}\n")
+        f.write("property list uchar int vertex_indices\nend_header\n")
+        for v in verts:
+            f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for face in faces:
+            f.write(f"3 {face[0]} {face[1]} {face[2]}\n")
+
+    return True
 
 
 # ── Conversión PLY → GLB ──────────────────────────────────────────────────────
@@ -346,8 +514,16 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         key=lambda p: len(list(p.glob("points3D.*"))) + len(list(p.glob("images.*")))
     )
 
-    # 5. Exportar nube de puntos densa a PLY
-    set_progress(job_id, 68, "entrenando", "Exportando nube de puntos 3D…")
+    # 5. Exportar modelo sparse a TXT (para visual hull) y PLY (fallback)
+    set_progress(job_id, 65, "entrenando", "Exportando modelo 3D…")
+    sparse_txt = job_dir / "sparse_txt"
+    sparse_txt.mkdir(exist_ok=True)
+    _run([
+        COLMAP_BIN, "model_converter",
+        "--input_path",  str(best_model),
+        "--output_path", str(sparse_txt),
+        "--output_type", "TXT",
+    ], env=_COLMAP_ENV)
     sparse_ply = job_dir / "sparse_points.ply"
     _run([
         COLMAP_BIN, "model_converter",
@@ -356,25 +532,31 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
         "--output_type", "PLY",
     ], env=_COLMAP_ENV)
 
-    # 6. Intentar malla Delaunay (mejor que convex hull)
-    set_progress(job_id, 78, "entrenando", "Generando malla 3D (Delaunay)…")
-    mesh_ply = job_dir / "mesh_delaunay.ply"
+    # 6. Visual Hull — forma real del objeto usando siluetas
+    set_progress(job_id, 75, "entrenando", "Reconstruyendo forma del objeto (visual hull)…")
+    hull_ply  = job_dir / "visual_hull.ply"
+    mesh_ply  = None
 
-    # Probar con y sin --DelaunayMeshing.input_type (varía según versión de COLMAP)
-    for extra in [["--DelaunayMeshing.input_type", "sparse"], []]:
-        r = subprocess.run(
-            _colmap_cmd([COLMAP_BIN, "delaunay_mesher",
-                         "--input_path",  str(best_model),
-                         "--output_path", str(mesh_ply),
-                         *extra]),
-            capture_output=True, text=True, timeout=600, env=_COLMAP_ENV
-        )
-        if r.returncode == 0 and mesh_ply.exists() and mesh_ply.stat().st_size > 1000:
-            break
-        mesh_ply.unlink(missing_ok=True)
+    if _visual_hull(sparse_txt, job_dir / "masks", hull_ply):
+        mesh_ply = hull_ply
+        print("[worker] visual hull exitoso")
     else:
-        # Fallback: reconstrucción Poisson con scipy sobre la nube sparse
-        mesh_ply = sparse_ply
+        print("[worker] visual hull falló, usando fallback Delaunay")
+        # Fallback: delaunay_mesher
+        dl_ply = job_dir / "mesh_delaunay.ply"
+        for extra in [["--DelaunayMeshing.input_type", "sparse"], []]:
+            r = subprocess.run(
+                _colmap_cmd([COLMAP_BIN, "delaunay_mesher",
+                             "--input_path",  str(best_model),
+                             "--output_path", str(dl_ply), *extra]),
+                capture_output=True, text=True, timeout=600, env=_COLMAP_ENV
+            )
+            if r.returncode == 0 and dl_ply.exists() and dl_ply.stat().st_size > 1000:
+                mesh_ply = dl_ply
+                break
+            dl_ply.unlink(missing_ok=True)
+        if mesh_ply is None:
+            mesh_ply = sparse_ply
 
     # 7. Convertir PLY → GLB
     set_progress(job_id, 90, "exportando", "Exportando a .GLB…")
