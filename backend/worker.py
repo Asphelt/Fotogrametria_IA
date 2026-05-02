@@ -337,9 +337,9 @@ def _visual_hull(
         from scipy.ndimage import (binary_closing, binary_opening,
                                    gaussian_filter, label as nd_label)
 
-        # 1. Limpiar ruido y rellenar huecos
+        # 1. Solo quitar vóxeles completamente aislados (preservar detalle)
         voxel_grid = binary_opening(voxel_grid, iterations=1)
-        voxel_grid = binary_closing(voxel_grid, iterations=3)
+        voxel_grid = binary_closing(voxel_grid, iterations=2)
 
         # 2. Quedarse con el componente conectado más grande
         labeled, n_comp = nd_label(voxel_grid)
@@ -348,22 +348,21 @@ def _visual_hull(
             largest = int(np.argmax(sizes)) + 1
             voxel_grid = (labeled == largest)
 
-        # 3. Suavizar el campo escalar antes de marching cubes
-        smooth_field = gaussian_filter(voxel_grid.astype(float), sigma=1.2)
+        # 3. Sigma bajo = más detalle, menos blur
+        smooth_field = gaussian_filter(voxel_grid.astype(float), sigma=0.7)
 
         from skimage.measure import marching_cubes
         verts, faces, _, _ = marching_cubes(smooth_field, level=0.5)
 
-        # Escalar a coordenadas del mundo
         scale = (mx - mn) / grid_size
         verts = verts * scale + mn
 
-        # 4. Suavizado Laplaciano de la malla
+        # 4. Menos iteraciones de suavizado para conservar forma
         import trimesh
         mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
         mesh.remove_degenerate_faces()
         mesh.remove_unreferenced_vertices()
-        trimesh.smoothing.filter_laplacian(mesh, lamb=0.5, iterations=15,
+        trimesh.smoothing.filter_laplacian(mesh, lamb=0.3, iterations=5,
                                            implicit_time_integration=False,
                                            volume_constraint=True)
 
@@ -566,7 +565,7 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
     hull_ply  = job_dir / "visual_hull.ply"
     mesh_ply  = None
 
-    if _visual_hull(sparse_txt, job_dir / "masks", hull_ply, grid_size=128):
+    if _visual_hull(sparse_txt, job_dir / "masks", hull_ply, grid_size=160):
         mesh_ply = hull_ply
         print("[worker] visual hull exitoso")
     else:
