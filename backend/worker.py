@@ -333,16 +333,45 @@ def _visual_hull(
 
     voxel_grid = voxels.reshape(grid_size, grid_size, grid_size)
 
-    # Marching cubes → malla
     try:
+        from scipy.ndimage import (binary_closing, binary_opening,
+                                   gaussian_filter, label as nd_label)
+
+        # 1. Limpiar ruido y rellenar huecos
+        voxel_grid = binary_opening(voxel_grid, iterations=1)
+        voxel_grid = binary_closing(voxel_grid, iterations=3)
+
+        # 2. Quedarse con el componente conectado más grande
+        labeled, n_comp = nd_label(voxel_grid)
+        if n_comp > 1:
+            sizes = [int((labeled == i).sum()) for i in range(1, n_comp + 1)]
+            largest = int(np.argmax(sizes)) + 1
+            voxel_grid = (labeled == largest)
+
+        # 3. Suavizar el campo escalar antes de marching cubes
+        smooth_field = gaussian_filter(voxel_grid.astype(float), sigma=1.2)
+
         from skimage.measure import marching_cubes
-        smooth = voxel_grid.astype(float)
-        verts, faces, _, _ = marching_cubes(smooth, level=0.5)
-        # Escalar verts a coordenadas del mundo
+        verts, faces, _, _ = marching_cubes(smooth_field, level=0.5)
+
+        # Escalar a coordenadas del mundo
         scale = (mx - mn) / grid_size
         verts = verts * scale + mn
+
+        # 4. Suavizado Laplaciano de la malla
+        import trimesh
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+        mesh.remove_degenerate_faces()
+        mesh.remove_unreferenced_vertices()
+        trimesh.smoothing.filter_laplacian(mesh, lamb=0.5, iterations=15,
+                                           implicit_time_integration=False,
+                                           volume_constraint=True)
+
+        verts = np.array(mesh.vertices)
+        faces = np.array(mesh.faces)
+
     except Exception as e:
-        print(f"[worker] marching_cubes error: {e}")
+        print(f"[worker] error en post-proceso de vóxeles: {e}")
         return False
 
     # Escribir PLY
@@ -537,7 +566,7 @@ def _process_colmap(job_id: str, job_dir: Path) -> None:
     hull_ply  = job_dir / "visual_hull.ply"
     mesh_ply  = None
 
-    if _visual_hull(sparse_txt, job_dir / "masks", hull_ply):
+    if _visual_hull(sparse_txt, job_dir / "masks", hull_ply, grid_size=128):
         mesh_ply = hull_ply
         print("[worker] visual hull exitoso")
     else:
